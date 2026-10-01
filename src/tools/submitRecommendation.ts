@@ -44,20 +44,24 @@ export function validateRecommendationGuardrails(
   action: ActionType,
   context: GuardrailValidationContext
 ): { valid: boolean; violationReason?: string; fallbackAction?: ActionType } {
+  // Every committed operational action must have a profitability and risk basis.
+  const commitmentActions: ActionType[] = ['ACCEPT', 'ACCEPT + SECURE RETURN LOAD', 'REASSIGN', 'NEGOTIATE', 'REJECT'];
+
+  if (commitmentActions.includes(action) && !context.profitCalculated) {
+    return {
+      valid: false,
+      violationReason: `${action} is not allowed before calculating trip profitability.`,
+      fallbackAction: 'WAIT',
+    };
+  }
+
   // 1. ACCEPT guardrails
   if (action === 'ACCEPT') {
-    if (!context.profitCalculated) {
+    if (!context.riskEvaluated) {
       return {
         valid: false,
-        violationReason: 'ACCEPT is not allowed before calculating trip profitability.',
+        violationReason: 'ACCEPT requires an explicit risk evaluation before committing the shipment.',
         fallbackAction: 'WAIT',
-      };
-    }
-    if (context.marginPercentage !== undefined && context.marginPercentage < 10 && !context.returnTripHasPositiveImprovement) {
-      return {
-        valid: false,
-        violationReason: `Trip margin (${context.marginPercentage}%) is below the 10% floor and no profitable return load was identified to recover empty return.`,
-        fallbackAction: 'REJECT',
       };
     }
     if (context.riskLevel === 'HIGH') {
@@ -67,7 +71,21 @@ export function validateRecommendationGuardrails(
         fallbackAction: 'REJECT',
       };
     }
-    if (context.driverReliability !== undefined && context.driverReliability < 70) {
+    if (context.marginPercentage !== undefined && context.marginPercentage < 10 && !context.returnTripHasPositiveImprovement) {
+      return {
+        valid: false,
+        violationReason: `Trip margin (${context.marginPercentage}%) is below the 10% floor and no profitable return load was identified to recover empty return.`,
+        fallbackAction: 'REJECT',
+      };
+    }
+    if (context.driverReliability === undefined) {
+      return {
+        valid: false,
+        violationReason: 'ACCEPT requires verified driver reliability data.',
+        fallbackAction: 'WAIT',
+      };
+    }
+    if (context.driverReliability < 70) {
       return {
         valid: false,
         violationReason: `Assigned driver reliability (${context.driverReliability}/100) is below the 70 threshold required for direct acceptance.`,
@@ -78,6 +96,20 @@ export function validateRecommendationGuardrails(
 
   // 2. ACCEPT + SECURE RETURN LOAD guardrails
   if (action === 'ACCEPT + SECURE RETURN LOAD') {
+    if (!context.riskEvaluated) {
+      return {
+        valid: false,
+        violationReason: 'Secure-return acceptance requires an explicit risk evaluation.',
+        fallbackAction: 'WAIT',
+      };
+    }
+    if (context.riskLevel === 'HIGH') {
+      return {
+        valid: false,
+        violationReason: 'A high-risk shipment cannot be committed merely because a return load is profitable.',
+        fallbackAction: 'REJECT',
+      };
+    }
     if (!context.returnTripSearched || !context.returnTripHasPositiveImprovement) {
       return {
         valid: false,
@@ -85,10 +117,24 @@ export function validateRecommendationGuardrails(
         fallbackAction: 'WAIT',
       };
     }
+    if (context.driverReliability === undefined || context.driverReliability < 70) {
+      return {
+        valid: false,
+        violationReason: 'Secure-return acceptance requires a verified driver with reliability of at least 70/100.',
+        fallbackAction: 'REASSIGN',
+      };
+    }
   }
 
   // 3. REASSIGN guardrails
   if (action === 'REASSIGN') {
+    if (!context.riskEvaluated) {
+      return {
+        valid: false,
+        violationReason: 'REASSIGN requires an explicit risk evaluation identifying the operational issue.',
+        fallbackAction: 'WAIT',
+      };
+    }
     if (!context.rankedDriversFetched || !context.replacementDriverFound || (context.replacementDriverScore !== undefined && context.replacementDriverScore < 80)) {
       return {
         valid: false,
@@ -118,13 +164,8 @@ export function validateRecommendationGuardrails(
 
   // 5. REJECT guardrails
   if (action === 'REJECT') {
-    if (!context.profitCalculated) {
-      return {
-        valid: false,
-        violationReason: 'REJECT requires trip profitability to be calculated first to justify financial infeasibility.',
-        fallbackAction: 'WAIT',
-      };
-    }
+    // Profitability is already required above. Risk is optional because a purely loss-making trip
+    // can be rejected without spending another tool call on risk analysis.
   }
 
   return { valid: true };
@@ -151,7 +192,6 @@ export function submitRecommendation(
 
   const data = parseResult.data;
 
-  // Check guardrails if context is provided
   if (context) {
     const guardrailCheck = validateRecommendationGuardrails(data.action as ActionType, context);
     if (!guardrailCheck.valid) {
